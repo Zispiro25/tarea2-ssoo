@@ -23,6 +23,16 @@
 #define FILE_ENTRY_SIZE 24
 #define FILE_ENTRY_COUNT 10
 
+#define FRAME_SIZE (32L * 1024L)
+
+typedef struct {
+    int process_id;
+    char file_name[15];
+    char mode;
+    uint64_t size;
+    uint32_t virtual_addr;
+} homerFile;
+
 char *path = NULL;
 FILE *archivo = NULL;
 
@@ -505,3 +515,160 @@ int file_table_slots(int process_id) {
 }
 
 //funciones de escritura
+uint32_t get_physical_address(int process_id, uint32_t virtual_address) {
+    uint32_t vpn = virtual_address >> 15 & 0x0FFF;
+    uint32_t offset = virtual_address & 0x7FFF;
+    for (uint32_t pfn = 0; pfn < IPT_ENTRIES; pfn++){
+        long ipt_entry_offset = IPT_OFFSET + (pfn * IPT_ENTRY_SIZE);
+        fseek(archivo, ipt_entry_offset, SEEK_SET);
+        unsigned char b[3];
+        fread(b, 1, 3, archivo);
+        uint32_t entry = ((uint32_t)b[0]) | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16);
+        uint8_t valid = (entry >> 23) & 0x01;
+        uint16_t pid_entry = (entry >> 13) & 0x3ff;
+        uint16_t vpn_entry = entry & 0x1FFF;
+        if (valid == 1 && pid_entry == (uint16_t)process_id && (vpn_entry & 0x0FFF) == vpn){
+            uint32_t paddr_rel = (pfn << 15) | offset;
+            uint32_t headers_size = (8 + 192 + 8) * 1024; //Por la tabla de PCBs, tabla invertida y bitmap
+            // Asi devolvemos siempre en area de datos
+            return headers_size + paddr_rel;
+        }
+    }
+    return 0xFFFFFFFF;
+}
+
+homerFile* open_file(int process_id, char* file_name, char mode){
+    // Revisar si el archivo existe
+    if (archivo == NULL){
+        return NULL;
+    }
+
+    int pcb_idx = -1;
+    for (int i = 0; i < PCB_COUNT; i++){
+        long pcb_addr = PCB_OFFSET + (i * PCB_ENTRY_SIZE);
+
+        fseek(archivo, pcb_addr, SEEK_SET);
+        uint8_t valid;
+        fread(&valid, 1, 1, archivo);
+        
+        fseek(archivo, pcb_addr + 15, SEEK_SET);
+        uint8_t id;
+        fread(&id, 1, 1, archivo);
+
+        if (valid == 0x01 && id == (uint8_t)process_id){
+            pcb_idx = i;
+            break;
+        }
+    }
+
+    // Revisar si el proceso existe
+    if (pcb_idx == -1){
+        return NULL;
+    }
+
+    long file_table_addr = PCB_OFFSET + (pcb_idx * PCB_ENTRY_SIZE) + FILE_TABLE_OFFSET;
+    int found_idx = -1;
+    int empty_idx = -1;
+    uint64_t file_size = 0;
+    uint32_t file_vaddr = 0;
+    for (int i = 0; i < FILE_ENTRY_COUNT; i++){
+        fseek(archivo, file_table_addr + (i * FILE_ENTRY_SIZE), SEEK_SET);
+        uint8_t valid;
+        fread(&valid, 1, 1, archivo);
+
+        char current_name[15];
+        fread(current_name, 1, 14, archivo);
+        current_name[14] = '\0';
+        if(valid == 0x01){
+            if (strcmp(current_name, file_name) == 0){
+                found_idx = i;
+                uint8_t size_bytes[5];
+                fread(size_bytes, 1, 5, archivo);
+                file_size = 0;
+                for (int b = 0; b < 5; b++){
+                    file_size = file_size | ((uint64_t)size_bytes[b] << (8*b));
+                }
+                fread(&file_vaddr, 4, 1, archivo);
+                break;
+            }
+        } else if(empty_idx == -1){
+            empty_idx = i;
+        }
+    }
+    if (mode == 'r'){
+        if (found_idx == -1){
+            return NULL;
+        }
+        homerFile* archivo_actual = malloc(sizeof(homerFile));
+        archivo_actual->process_id = process_id;
+        strncpy(archivo_actual->file_name, file_name, 14);
+        archivo_actual->file_name[14] = '\0';
+        archivo_actual->mode = 'r';
+        archivo_actual->size = file_size;
+        archivo_actual->virtual_addr = file_vaddr;
+        return archivo_actual;
+    } else if(mode == 'w'){
+        if (found_idx != -1){
+            return NULL;
+        }
+        if (empty_idx == -1){
+            return NULL;
+        }
+        homerFile* archivo_actual = malloc(sizeof(homerFile));
+        archivo_actual->process_id = process_id;
+        strncpy(archivo_actual->file_name, file_name, 14);
+        archivo_actual->file_name[14] = '\0';
+        archivo_actual->mode = 'w';
+        archivo_actual->size =  0;
+        archivo_actual->virtual_addr = 0;
+        return archivo_actual;
+    }
+    return NULL;
+}
+
+int read_file(homerFile* file_desc, char* dest){
+    FILE* local_file = fopen(dest, "wb");
+    if (local_file == NULL){
+        return -1;
+    }
+    uint64_t total_read_bytes = 0;
+    while (total_read_bytes < file_desc->size){
+        uint32_t vaddr_actual = file_desc->virtual_addr + total_read_bytes;
+        uint32_t paddr = get_physical_address(file_desc->process_id, vaddr_actual);
+        if (paddr == 0xFFFFFFFF){
+            break;
+        }
+        uint32_t current_offset = vaddr_actual & 0x7FFF;
+        uint32_t remaining_frame = FRAME_SIZE - current_offset;
+        uint32_t remaining_file = file_desc->size - total_read_bytes;
+        uint32_t to_read;
+        if(remaining_file < remaining_frame){
+            to_read = remaining_file;
+        } else {
+            to_read = remaining_frame;
+        }
+
+        unsigned char* buffer = malloc(to_read);
+        fseek(archivo, paddr, SEEK_SET);
+        fread(buffer, 1, to_read, archivo);
+        fwrite(buffer, 1, to_read, local_file);
+        free(buffer);
+        total_read_bytes += to_read;
+    }
+    fclose(local_file);
+    return total_read_bytes;
+}
+
+int write_file(homerFile* file_desc, char* src){
+
+}
+
+void delete_file(int process_id, char* file_name){
+
+}
+
+void close_file(homerFile* file_desc){
+    if (file_desc != NULL){
+        free(file_desc);
+    }
+}
