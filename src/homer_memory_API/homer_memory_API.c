@@ -224,10 +224,10 @@ void list_files(int process_id) {
                         ((uint64_t)tabla[base + 19] << 32);
 
                     uint32_t dir_v =
-                        ((uint32_t)tabla[base + 20] << 24) |
-                        ((uint32_t)tabla[base + 21] << 16) |
-                        ((uint32_t)tabla[base + 22] << 8) |
-                        ((uint32_t)tabla[base + 23]);
+                        ((uint32_t)tabla[base + 20]) |
+                        ((uint32_t)tabla[base + 21] << 8) |
+                        ((uint32_t)tabla[base + 22] << 16) |
+                        ((uint32_t)tabla[base + 23] << 24);
 
                     uint32_t offset = dir_v & 0x7FFF;
                     uint32_t vpn = (dir_v >> 15) & 0x0FFF;
@@ -716,6 +716,7 @@ int write_file(homerFile* file_desc, char* src){
         return -1;
     }
     
+    //Se busca la ultima vaddr ocupada para asignar la nueva vaddr al final de esta
     uint32_t start_vaddr = 0;
     long file_table_addr = PCB_OFFSET + (pcb_idx * PCB_ENTRY_SIZE) + FILE_TABLE_OFFSET;
     for (int i = 0; i < FILE_ENTRY_COUNT; i++){
@@ -742,12 +743,16 @@ int write_file(homerFile* file_desc, char* src){
     file_desc->virtual_addr = start_vaddr;
     uint64_t total_written = 0;
     uint32_t current_vaddr = start_vaddr;
+
+    //Se escribe el archivo dividiendolo en paginas
     while (total_written < to_write){
         uint32_t vpn = (current_vaddr >> 15) & 0x0FFF;
         uint32_t offset = current_vaddr & 0x7FFF;
         uint32_t paddr = get_physical_address(file_desc->process_id, current_vaddr);
         if (paddr == 0xFFFFFFFF){
             int pfn_found = -1;
+
+            //Se busca el primer frame libre en el bitmap
             fseek(archivo, BITMAP_OFFSET, SEEK_SET);
             for (int i = 0; i < BITMAP_SIZE; i++){
                 uint8_t byte;
@@ -768,9 +773,12 @@ int write_file(homerFile* file_desc, char* src){
             if (pfn_found == -1){
                 break;
             }
+            //Se asigna el frame en la IPT
             update_ipt_entry(file_desc->process_id, vpn, pfn_found, true);
             paddr = (8 + 192 + 8) * 1024 + (pfn_found << 15) + offset;
         }
+
+        //Se calcula el espacio disp en el frame actual
         uint32_t space_in_frame = FRAME_SIZE - offset;
         uint32_t remaining_to_write = to_write - total_written;
         if (remaining_to_write > space_in_frame){
@@ -785,6 +793,7 @@ int write_file(homerFile* file_desc, char* src){
         current_vaddr += remaining_to_write;
     }
 
+    //Se guardan los metadatos del archivo
     long target_file_entry_addr = PCB_OFFSET + (pcb_idx * PCB_ENTRY_SIZE) + FILE_TABLE_OFFSET + (file_desc->file_index * FILE_ENTRY_SIZE);
     fseek(archivo, target_file_entry_addr, SEEK_SET);
     uint8_t valid_out = 0x01;
