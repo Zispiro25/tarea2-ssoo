@@ -17,7 +17,7 @@ int main(int argc, char const *argv[]) {
   printf("File-table free slots (pid=10): %d\n", slots_arch);
 
   homerFile* f = open_file(10, "dino.jpg", 'w'); 
-  write_file(f, "Memoria/Cmd/dino.jpg");
+  write_file(f, "dino.jpg");
 
   f = open_file(10, "dino.jpg", 'r'); 
   read_file(f, "dino_copia.jpg");
