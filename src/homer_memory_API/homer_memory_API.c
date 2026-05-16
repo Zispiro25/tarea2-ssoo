@@ -25,14 +25,6 @@
 
 #define FRAME_SIZE (32L * 1024L)
 
-typedef struct {
-    int process_id;
-    char file_name[15];
-    char mode;
-    uint64_t size;
-    uint32_t virtual_addr;
-} homerFile;
-
 char *path = NULL;
 FILE *archivo = NULL;
 
@@ -611,7 +603,7 @@ homerFile* open_file(int process_id, char* file_name, char mode){
             return NULL;
         }
 
-        // Se falta el bit de validez y de nombre
+        // Se salta el bit de validez y de nombre
         fseek(archivo, file_table_addr + (found_idx * FILE_ENTRY_SIZE) + 15, SEEK_SET);
         
         // Se calcula el tamaño del archivo
@@ -632,8 +624,11 @@ homerFile* open_file(int process_id, char* file_name, char mode){
         strncpy(archivo_actual->file_name, file_name, 14);
         archivo_actual->file_name[14] = '\0';
         archivo_actual->mode = 'r';
-        archivo_actual->size = file_size;
+        archivo_actual->file_size = file_size;
         archivo_actual->virtual_addr = file_vaddr;
+        archivo_actual->pcb_index = pcb_idx;
+        archivo_actual->file_index = found_idx;
+        archivo_actual->valid = true;
         return archivo_actual;
     } else if(mode == 'w'){
         if (found_idx != -1){
@@ -662,8 +657,11 @@ homerFile* open_file(int process_id, char* file_name, char mode){
         strncpy(archivo_actual->file_name, file_name, 14);
         archivo_actual->file_name[14] = '\0';
         archivo_actual->mode = 'w';
-        archivo_actual->size =  0;
+        archivo_actual->file_size =  0;
         archivo_actual->virtual_addr = 0;
+        archivo_actual->pcb_index = pcb_idx;
+        archivo_actual->file_index = empty_idx;
+        archivo_actual->valid = true;
         return archivo_actual;
     }
     return NULL;
@@ -675,7 +673,7 @@ int read_file(homerFile* file_desc, char* dest){
         return -1;
     }
     uint64_t total_read_bytes = 0;
-    while (total_read_bytes < file_desc->size){
+    while (total_read_bytes < file_desc->file_size){
         uint32_t vaddr_actual = file_desc->virtual_addr + total_read_bytes;
         uint32_t paddr = get_physical_address(file_desc->process_id, vaddr_actual);
         if (paddr == 0xFFFFFFFF){
@@ -685,7 +683,7 @@ int read_file(homerFile* file_desc, char* dest){
         //Se calcula el espacio restante del frame y del archivo
         uint32_t current_offset = vaddr_actual & 0x7FFF;
         uint32_t remaining_frame = FRAME_SIZE - current_offset;
-        uint32_t remaining_file = file_desc->size - total_read_bytes;
+        uint32_t remaining_file = file_desc->file_size - total_read_bytes;
         uint32_t to_read;
         if(remaining_file < remaining_frame){
             to_read = remaining_file;
@@ -713,7 +711,7 @@ int write_file(homerFile* file_desc, char* src){
     uint64_t to_write = ftell(local_file);
     rewind(local_file);
 
-    int pcb_idx = search_pcb_index(file_desc->process_id);
+    int pcb_idx = file_desc->pcb_index;
     if (pcb_idx == -1){
         return -1;
     }
@@ -741,6 +739,7 @@ int write_file(homerFile* file_desc, char* src){
             }
         }
     }
+    file_desc->virtual_addr = start_vaddr;
     uint64_t total_written = 0;
     uint32_t current_vaddr = start_vaddr;
     while (total_written < to_write){
@@ -785,27 +784,20 @@ int write_file(homerFile* file_desc, char* src){
         total_written += remaining_to_write;
         current_vaddr += remaining_to_write;
     }
-    for (int i = 0; i < FILE_ENTRY_COUNT; i++){
-        long pcb_addr = file_table_addr + (i * FILE_ENTRY_SIZE);
-        fseek(archivo, pcb_addr, SEEK_SET);
-        uint8_t valid;
-        fread(&valid, 1, 1, archivo);
 
-        if (valid == 0x00){
-            fseek(archivo, -1, SEEK_CUR);
-            uint8_t valid_out = 0x01;
-            fwrite(&valid_out, 1, 1, archivo);
-            fwrite(file_desc->file_name, 1, 14, archivo);
-            uint8_t size_bytes[5];
-            for (int b = 0; b < 5; b++){
-                size_bytes[b] = (to_write >> (8*b)) & 0xFF;
-            }
-            fwrite(size_bytes, 1, 5, archivo);
-            fwrite(&file_desc->virtual_addr, 4, 1, archivo);
-            break;
-        }
+    long target_file_entry_addr = PCB_OFFSET + (pcb_idx * PCB_ENTRY_SIZE) + FILE_TABLE_OFFSET + (file_desc->file_index * FILE_ENTRY_SIZE);
+    fseek(archivo, target_file_entry_addr, SEEK_SET);
+    uint8_t valid_out = 0x01;
+    fwrite(&valid_out, 1, 1, archivo);
+    fwrite(file_desc->file_name, 1, 14, archivo);
+    uint8_t size_bytes[5];
+    for (int b = 0; b < 5; b++){
+        size_bytes[b] = (total_written >> (8*b)) & 0xFF;
     }
-    file_desc->size = total_written;
+    fwrite(size_bytes, 1, 5, archivo);
+    fwrite(&file_desc->virtual_addr, 4, 1, archivo);
+
+    file_desc->file_size = total_written;
     fclose(local_file);
     return total_written;
 }       
@@ -856,7 +848,7 @@ void delete_file(int process_id, char* file_name){
                 uint32_t vaddr;
                 fread(&vaddr, 4, 1, archivo);
                 uint32_t other_vpn_start = (vaddr >> 15) & 0x0FFF;
-                uint32_t other_vpn_end = ((vaddr + size) >> 15) & 0x0FFF;
+                uint32_t other_vpn_end = ((vaddr + size -1 ) >> 15) & 0x0FFF;//ver aqui
                 if (vpn >= other_vpn_start && vpn <= other_vpn_end){
                     vpn_used = true;
                     break;
